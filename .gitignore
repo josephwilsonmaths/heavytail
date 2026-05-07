@@ -3,6 +3,8 @@
 *.pt
 *.ckpt
 .cache/
-data
+data/
 torch_home/
 old_ww_current_torchvision_all_default/_temporary_torch_cache/
+old_ww_current_torchvision_all_default_spectralnorms/
+ww_trends_2020_repo_v1_summaries/

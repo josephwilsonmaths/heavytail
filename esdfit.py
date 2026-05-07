@@ -1537,6 +1537,9 @@ class ESDFit(object):
                           fig_width=10,
                           fig_height=6,
                           fontsize=12,
+                          ticksize=10,
+                          legendsize=10,
+                          legendbox=True,
                           task='arc_easy',
                           metric='acc',
                           shot='zero-shot',
@@ -1551,6 +1554,7 @@ class ESDFit(object):
                           optimal_ratio=None,
                           marker_size=8,
                           title=True,
+                          legend_on=True,
                           tight_layout=True):
         if self.fileloader._is_moonlight_model():
             raise NotImplementedError("Moonlight models do not yet support plotting test accuracy against free energy.")
@@ -1645,8 +1649,14 @@ class ESDFit(object):
             ax1.set_xlabel(xlabel, fontsize=fontsize)
             ax1.set_ylabel('Test Accuracy', fontsize=fontsize)
             ax2.set_ylabel('Free Energy', fontsize=fontsize)
-            ax1.tick_params(axis='y')
-            ax2.tick_params(axis='y')
+            ax1.tick_params(axis='y', labelsize=ticksize)
+            ax1.tick_params(axis='x', labelsize=ticksize)
+            ax2.tick_params(axis='y', labelsize=ticksize)
+            ax2.tick_params(axis='x', labelsize=ticksize)
+            # Only have 5 ticks for x and y axis
+            ax1.locator_params(axis='x', nbins=5)
+            ax1.locator_params(axis='y', nbins=5)
+            ax2.locator_params(axis='y', nbins=5)
             if title:
                 ax1.set_title(f'{self.model.upper()} ($r$: {corr:.3f}, $\lambda$: {self.lam:.2f})', fontweight='bold', fontsize=fontsize)
 
@@ -1667,7 +1677,8 @@ class ESDFit(object):
 
             lines = test_line + [test_band] + free_line + [free_band] + theoretical_line
             labels = [line.get_label() for line in test_line] + [test_band.get_label()] + [line.get_label() for line in free_line] + [free_band.get_label()] + [line.get_label() for line in theoretical_line]
-            ax1.legend(lines, labels, loc='best')
+            if legend_on:
+                ax1.legend(lines, labels, loc='best', fontsize=legendsize, frameon=legendbox)
         else:
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(fig_width, fig_height), sharex=True)
             test_line = ax1.plot(xs, test_accs, marker='o', markerfacecolor='none', color='red', label='Mean')
@@ -1681,7 +1692,7 @@ class ESDFit(object):
             )
             ax1.set_ylabel('Test Accuracy')
             ax1.set_xlabel(xlabel)
-            ax1.tick_params(axis='y')
+            ax1.tick_params(axis='y', labelsize=ticksize)
             ax1.legend(test_line + [test_band], [line.get_label() for line in test_line] + [test_band.get_label()], loc='best')
             if log_x:
                 ax1.set_xscale('log')
