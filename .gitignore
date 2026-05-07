@@ -1,1 +1,8 @@
 /.venv
+*.pth
+*.pt
+*.ckpt
+.cache/
+data
+torch_home/
+old_ww_current_torchvision_all_default/_temporary_torch_cache/
