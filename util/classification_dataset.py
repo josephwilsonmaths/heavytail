@@ -4,29 +4,60 @@ from torchvision.transforms import ToTensor
 from torchvision import datasets
 from torch.utils.data import DataLoader
 import numpy as np
+import os
 
-def get_dataset(name, subsample, augment = False):
+def _dataset_root(data_dir, dataset_name):
+    normalized_dir = os.path.normpath(data_dir)
+    if os.path.basename(normalized_dir).lower() == dataset_name.lower():
+        return normalized_dir
+    return os.path.join(normalized_dir, dataset_name)
+
+
+def _validate_dataset_root(root, download, dataset_name):
+    if not download and not os.path.isdir(root):
+        raise FileNotFoundError(
+            f"{dataset_name} dataset directory was not found at '{root}'. "
+            "Pass a valid --data_dir or omit --no_download to allow fetching it."
+        )
+
+
+def _load_with_optional_download(dataset_ctor, dataset_name, root, download, **kwargs):
+    try:
+        return dataset_ctor(root=root, download=download, **kwargs)
+    except RuntimeError as exc:
+        if not download:
+            raise FileNotFoundError(
+                f"{dataset_name} data was not ready under '{root}'. "
+                "Pass a directory containing the extracted torchvision dataset files, "
+                "or omit --no_download to allow fetching them."
+            ) from exc
+        raise
+
+
+def get_dataset(name, subsample, augment=False, data_dir="data", download=True, include_ood=True):
     if name=='mnist':
         training_data = datasets.MNIST(
-            root="data/MNIST",
+            root=_dataset_root(data_dir, "MNIST"),
             train=True,
-            download=True,
+            download=download,
             transform=ToTensor()
         )
 
         test_data = datasets.MNIST(
-            root="data/MNIST",
+            root=_dataset_root(data_dir, "MNIST"),
             train=False,
-            download=True,
+            download=download,
             transform=ToTensor()
         )
 
-        ood_test_data = datasets.FashionMNIST(
-            root="data/FashionMNIST",
-            train=False,
-            download=True,
-            transform=ToTensor()
-        )
+        ood_test_data = None
+        if include_ood:
+            ood_test_data = datasets.FashionMNIST(
+                root=_dataset_root(data_dir, "FashionMNIST"),
+                train=False,
+                download=download,
+                transform=ToTensor()
+            )
 
         _, val_data = torch.utils.data.random_split(training_data,[50000,10000])
         n_output = 10
@@ -35,25 +66,27 @@ def get_dataset(name, subsample, augment = False):
 
     elif name=='fmnist':
         training_data = datasets.FashionMNIST(
-            root="data/FashionMNIST",
+            root=_dataset_root(data_dir, "FashionMNIST"),
             train=True,
-            download=True,
+            download=download,
             transform=ToTensor()
         )
 
         test_data = datasets.FashionMNIST(
-            root="data/FashionMNIST",
+            root=_dataset_root(data_dir, "FashionMNIST"),
             train=False,
-            download=True,
+            download=download,
             transform=ToTensor()
         )
 
-        ood_test_data = datasets.MNIST(
-            root="data/MNIST",
-            train=False,
-            download=True,
-            transform=ToTensor()
-        ) 
+        ood_test_data = None
+        if include_ood:
+            ood_test_data = datasets.MNIST(
+                root=_dataset_root(data_dir, "MNIST"),
+                train=False,
+                download=download,
+                transform=ToTensor()
+            ) 
 
         _, val_data = torch.utils.data.random_split(training_data,[50000,10000])
         n_output = 10
@@ -61,6 +94,17 @@ def get_dataset(name, subsample, augment = False):
         input_size = 28
 
     elif name=='cifar10':
+        cifar10_root = _dataset_root(data_dir, "CIFAR10")
+        _validate_dataset_root(cifar10_root, download, "CIFAR10")
+        training_data = _load_with_optional_download(
+            datasets.CIFAR10,
+            "CIFAR10",
+            cifar10_root,
+            download,
+            train=True,
+            transform=transforms.ToTensor()
+        )
+
         if augment:
             transform_train = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
@@ -69,10 +113,7 @@ def get_dataset(name, subsample, augment = False):
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
             ])
         else:
-            temp_dataset = datasets.CIFAR10(
-                root="data/CIFAR10", train=True, download=True, transform=transforms.ToTensor())
-            temp_loader = torch.utils.data.DataLoader(temp_dataset, batch_size=len(temp_dataset), shuffle=False)
-            data, _ = next(iter(temp_loader))
+            data = torch.as_tensor(training_data.data).permute(0, 3, 1, 2).to(torch.float32) / 255.0
             mean = data.mean(dim=(0, 2, 3))
             std = data.std(dim=(0, 2, 3))
             d = data[0].numel()  # 3*32*32 = 3072
@@ -92,26 +133,32 @@ def get_dataset(name, subsample, augment = False):
         else:
             transform_test = transform_train
 
-        training_data = datasets.CIFAR10(
-            root="data/CIFAR10",
+        training_data = _load_with_optional_download(
+            datasets.CIFAR10,
+            "CIFAR10",
+            cifar10_root,
+            download,
             train=True,
-            download=True,
             transform=transform_train
         )
 
-        test_data = datasets.CIFAR10(
-            root="data/CIFAR10",
+        test_data = _load_with_optional_download(
+            datasets.CIFAR10,
+            "CIFAR10",
+            cifar10_root,
+            download,
             train=False,
-            download=True,
             transform=transform_test
         )
 
-        ood_test_data = datasets.CIFAR100(
-            root="data/CIFAR100",
-            train=False,
-            download=True,
-            transform=transform_test
-        ) 
+        ood_test_data = None
+        if include_ood:
+            ood_test_data = datasets.CIFAR100(
+                root=_dataset_root(data_dir, "CIFAR100"),
+                train=False,
+                download=download,
+                transform=transform_test
+            ) 
 
         _, val_data = torch.utils.data.random_split(training_data,[40000,10000])
         n_output = 10
@@ -119,6 +166,8 @@ def get_dataset(name, subsample, augment = False):
         input_size = 32
 
     elif name=='svhn':
+        svhn_root = _dataset_root(data_dir, "SVHN")
+        _validate_dataset_root(svhn_root, download, "SVHN")
         if augment:
             transform_train = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
@@ -138,16 +187,16 @@ def get_dataset(name, subsample, augment = False):
         ])
 
         training_data = datasets.SVHN(
-            root="data/SVHN",
+            root=svhn_root,
             split='train',
-            download=True,
+            download=download,
             transform=transform_train
         )
 
         test_data = datasets.SVHN(
-            root="data/SVHN",
+            root=svhn_root,
             split='test',
-            download=True,
+            download=download,
             transform=transform_test
         )
 
@@ -156,12 +205,14 @@ def get_dataset(name, subsample, augment = False):
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
         ])
 
-        ood_test_data = datasets.CIFAR10(
-            root="data/CIFAR10",
-            train=False,
-            download=True,
-            transform=transform_test_cifar
-        ) 
+        ood_test_data = None
+        if include_ood:
+            ood_test_data = datasets.CIFAR10(
+                root=_dataset_root(data_dir, "CIFAR10"),
+                train=False,
+                download=download,
+                transform=transform_test_cifar
+            ) 
 
         _, val_data = torch.utils.data.random_split(training_data,[0.9,0.1])
         n_output = 10
@@ -169,6 +220,8 @@ def get_dataset(name, subsample, augment = False):
         input_size = 32
 
     elif name=='cifar100':
+        cifar100_root = _dataset_root(data_dir, "CIFAR100")
+        _validate_dataset_root(cifar100_root, download, "CIFAR100")
         if augment:
             transform_train = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
@@ -189,27 +242,29 @@ def get_dataset(name, subsample, augment = False):
         ])
 
         training_data = datasets.CIFAR100(
-            root="data/CIFAR100",
+            root=cifar100_root,
             train=True,
-            download=True,
+            download=download,
             transform=transform_train
         )
 
         test_data = datasets.CIFAR100(
-            root="data/CIFAR100",
+            root=cifar100_root,
             train=False,
-            download=True,
+            download=download,
             transform=transform_test
         )
 
-        ood_test_data = datasets.CIFAR10(
-            root="data/CIFAR10",
-            train=False,
-            download=True,
-            transform=transform_test
-        ) 
+        ood_test_data = None
+        if include_ood:
+            ood_test_data = datasets.CIFAR10(
+                root=_dataset_root(data_dir, "CIFAR10"),
+                train=False,
+                download=download,
+                transform=transform_test
+            ) 
 
-        _, val_data = torch.utils.data.random_split(training_data,[50000,10000])
+        val_data = test_data
         n_output = 100
         n_channels = 3
         input_size = 32
@@ -243,7 +298,9 @@ def get_dataset(name, subsample, augment = False):
 
         print('loading datasets')
 
-        ood_test_data = datasets.ImageFolder(r'data/imagenet-o/imagenet-o', transform=ood_transform)
+        ood_test_data = None
+        if include_ood:
+            ood_test_data = datasets.ImageFolder(os.path.join(data_dir, 'imagenet-o', 'imagenet-o'), transform=ood_transform)
 
         n_output = 1000
         n_channels = 3
@@ -259,13 +316,21 @@ def get_dataset(name, subsample, augment = False):
         training_data = torch.utils.data.Subset(training_data,range(n_train))
         test_data = torch.utils.data.Subset(test_data,range(n_test))
         val_data = torch.utils.data.Subset(val_data,range(n_test))
-        ood_test_data = torch.utils.data.Subset(ood_test_data,range(n_test))
+        if ood_test_data is not None:
+            ood_test_data = torch.utils.data.Subset(ood_test_data,range(n_test))
 
     return training_data, test_data, val_data, ood_test_data, n_output, n_channels, input_size
 
 class load_dataset(object):
-    def __init__(self, name, subsample, augment=False, shuffle=False):
-        training_data, test_data, val_data, ood_test_data, n_output, n_channels, input_size = get_dataset(name=name, subsample=subsample, augment=augment)
+    def __init__(self, name, subsample, augment=False, shuffle=False, data_dir="data", download=True, include_ood=True):
+        training_data, test_data, val_data, ood_test_data, n_output, n_channels, input_size = get_dataset(
+            name=name,
+            subsample=subsample,
+            augment=augment,
+            data_dir=data_dir,
+            download=download,
+            include_ood=include_ood,
+        )
         self.training_data = training_data
         self.test_data = test_data
         self.val_data = val_data
@@ -285,6 +350,8 @@ class load_dataset(object):
         return DataLoader(self.val_data, batch_size=batch_size, shuffle=False)
     
     def oodtestloader(self, batch_size):
+        if self.ood_test_data is None:
+            raise ValueError("OOD dataset was not loaded for this dataset instance.")
         return DataLoader(self.ood_test_data, batch_size=batch_size, shuffle=False)
 
     

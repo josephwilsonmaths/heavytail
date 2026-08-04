@@ -7,4 +7,8 @@ data/
 torch_home/
 old_ww_current_torchvision_all_default/_temporary_torch_cache/
 old_ww_current_torchvision_all_default_spectralnorms/
+torchvision_0_4_2_checkpoints/
 ww_trends_2020_repo_v1_summaries/
+figures/paper
+evals/
+results/

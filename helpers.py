@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 from scipy.io import arff
 import math
 
+from scipy import stats
 from scipy.stats import rv_continuous
 from scipy.special import hyp1f1, loggamma
 from scipy.optimize import fmin
@@ -695,6 +696,261 @@ def _get_optimizer_resnet_checkpoint_dir(model_name, dataset, *, data_root="data
     return base_model, optimizer_name, checkpoint_dir
 
 
+def _get_modelzoo_checkpoint_dir(model_name, dataset, *, data_root="data/modelzoo", seed=0):
+    short_model_name = str(model_name).strip().lower()
+    short_dataset = str(dataset).strip().lower()
+    checkpoint_dir = Path(data_root) / f"{short_model_name}_{short_dataset}" / f"seed_{int(seed)}"
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Could not find ModelZoo checkpoint directory: {checkpoint_dir}")
+    return short_model_name, short_dataset, checkpoint_dir
+
+
+def _modelzoo_checkpoint_sort_key(file_path):
+    match = re.fullmatch(r"checkpoint_(\d+)", file_path.name)
+    if match is None:
+        raise ValueError(f"Unexpected ModelZoo checkpoint directory name: {file_path.name}")
+    return int(match.group(1))
+
+
+def list_modelzoo_seeds(model_name, dataset, *, data_root="data/modelzoo"):
+    short_model_name = str(model_name).strip().lower()
+    short_dataset = str(dataset).strip().lower()
+    model_dir = Path(data_root) / f"{short_model_name}_{short_dataset}"
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Could not find ModelZoo model directory: {model_dir}")
+
+    seeds = []
+    for file_path in model_dir.glob("seed_*"):
+        match = re.fullmatch(r"seed_(\d+)", file_path.name)
+        if match:
+            seeds.append(int(match.group(1)))
+
+    if not seeds:
+        raise ValueError(f"No ModelZoo seed directories found in {model_dir}")
+
+    return sorted(seeds)
+
+
+def list_modelzoo_checkpoint_steps(model_name, dataset, *, data_root="data/modelzoo", seed=0):
+    """Return all available checkpoint steps for one ModelZoo seed directory."""
+
+    _, _, checkpoint_dir = _get_modelzoo_checkpoint_dir(
+        model_name,
+        dataset,
+        data_root=data_root,
+        seed=seed,
+    )
+
+    steps = []
+    for file_path in sorted(checkpoint_dir.glob("checkpoint_*"), key=_modelzoo_checkpoint_sort_key):
+        steps.append(_modelzoo_checkpoint_sort_key(file_path))
+
+    if not steps:
+        raise ValueError(f"No ModelZoo checkpoints found in {checkpoint_dir}")
+
+    return steps
+
+
+def _get_modelzoo_progress_row(progress_df, step):
+    if "training_iteration" in progress_df.columns:
+        step_rows = progress_df.loc[progress_df["training_iteration"] == int(step)]
+        if not step_rows.empty:
+            return step_rows.iloc[-1]
+
+    if int(step) < 0 or int(step) >= len(progress_df):
+        raise IndexError(f"ModelZoo checkpoint step {step} is out of bounds for progress.csv with {len(progress_df)} rows.")
+
+    return progress_df.iloc[int(step)]
+
+
+def _load_modelzoo_checkpoint_payload(model_name, dataset, step, seed, *, data_root="data/modelzoo"):
+    short_model_name, short_dataset, checkpoint_dir = _get_modelzoo_checkpoint_dir(
+        model_name,
+        dataset,
+        data_root=data_root,
+        seed=seed,
+    )
+    step = int(step)
+    seed = int(seed)
+
+    checkpoint_path = checkpoint_dir / f"checkpoint_{step:06d}" / "checkpoints"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Could not find ModelZoo checkpoint file: {checkpoint_path}")
+
+    progress_path = checkpoint_dir / "progress.csv"
+    if not progress_path.exists():
+        raise FileNotFoundError(f"Could not find ModelZoo progress file: {progress_path}")
+
+    params_path = checkpoint_dir / "params.json"
+    if not params_path.exists():
+        raise FileNotFoundError(f"Could not find ModelZoo params file: {params_path}")
+
+    state_dict = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+    progress_df = pd.read_csv(progress_path)
+    progress_row = _get_modelzoo_progress_row(progress_df, step)
+
+    with params_path.open("r", encoding="utf-8") as handle:
+        params = json.load(handle)
+
+    return {
+        "short_model_name": short_model_name,
+        "short_dataset": short_dataset,
+        "step": step,
+        "seed": seed,
+        "state_dict": state_dict,
+        "progress_row": progress_row,
+        "params": params,
+    }
+
+
+def _modelzoo_tensor_summary(weight, *, flatten=False):
+    weight = weight.detach().to(dtype=torch.float64)
+    if flatten:
+        weight = weight.flatten(1, -1)
+    eigvals = torch.linalg.eigvalsh(weight @ weight.T)
+    return {
+        "eigvals": eigvals.cpu().numpy(),
+        "aspect_ratio": weight.shape[0] / weight.shape[1],
+    }
+
+
+def _build_modelzoo_summary_dict(payload):
+    state_dict = payload["state_dict"]
+    progress_row = payload["progress_row"]
+    params = payload["params"]
+
+    res_dict = {
+        "model": payload["short_model_name"],
+        "dataset": payload["short_dataset"],
+        "epoch": payload["step"],
+        "repeat": payload["seed"],
+        "batch_size": int(params["training::batchsize"]),
+        "subsample": False,
+        "seed": payload["seed"],
+        "train_loss": float(progress_row["train_loss"]),
+        "train_acc": float(progress_row["train_acc"]),
+        "test_loss": float(progress_row["test_loss"]),
+        "test_acc": float(progress_row["test_acc"]),
+        "FC": {},
+        "Conv2": {},
+    }
+
+    if "fc.weight" in state_dict:
+        res_dict["FC"] = _modelzoo_tensor_summary(state_dict["fc.weight"], flatten=True)
+
+    conv2_tensor_names = sorted(
+        [name for name in state_dict.keys() if re.fullmatch(r"layer\d+\.\d+\.conv2\.weight", name)],
+        key=_optimizer_resnet_conv2_sort_key,
+    )
+    for layer_idx, tensor_name in enumerate(conv2_tensor_names):
+        res_dict["Conv2"][layer_idx] = {
+            **_modelzoo_tensor_summary(state_dict[tensor_name], flatten=True),
+            "tensor_name": tensor_name,
+        }
+
+    if not res_dict["FC"] and not res_dict["Conv2"]:
+        raise KeyError(
+            "No supported ModelZoo tensors found. Expected 'fc.weight' and/or 'layer*.conv2.weight'."
+        )
+
+    return res_dict
+
+
+def _save_modelzoo_summary_dict(res_dict, results_dir):
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    save_path = results_dir / (
+        f"{res_dict['model']}_{res_dict['dataset']}_b{int(res_dict['batch_size'])}_{int(res_dict['epoch'])}_{int(res_dict['repeat'])}.pt"
+    )
+    torch.save(res_dict, save_path)
+    return save_path
+
+
+def save_modelzoo_checkpoint_summary(
+    model_name,
+    dataset,
+    step,
+    seed,
+    *,
+    data_root="data/modelzoo",
+    results_dir="results/htmp/epoch",
+):
+    """Convert one ModelZoo checkpoint into an epoch-style summary.
+
+    The saved dictionary contains:
+        - FC: eigenvalues/aspect ratio for W=fc.weight
+        - Conv2: per-layer eigenvalues/aspect ratio for W=layer*.conv2.weight.flatten(1)
+        - train/test metrics from progress.csv
+    """
+
+    payload = _load_modelzoo_checkpoint_payload(
+        model_name,
+        dataset,
+        step,
+        seed,
+        data_root=data_root,
+    )
+    res_dict = _build_modelzoo_summary_dict(payload)
+    save_path = _save_modelzoo_summary_dict(res_dict, results_dir)
+    return res_dict, save_path
+
+
+def save_all_modelzoo_checkpoint_summaries(
+    model_name,
+    dataset,
+    *,
+    steps=None,
+    seeds=None,
+    data_root="data/modelzoo",
+    results_dir="results/htmp/epoch",
+    verbose=False,
+):
+    """Convert ModelZoo checkpoints into ESDFit-compatible epoch summaries."""
+
+    seeds_to_save = list_modelzoo_seeds(model_name, dataset, data_root=data_root) if seeds is None else [int(seed) for seed in seeds]
+    requested_steps = None if steps is None else {int(step) for step in steps}
+    saved_paths = []
+
+    available_steps_per_seed = {}
+    for seed in seeds_to_save:
+        available_steps = list_modelzoo_checkpoint_steps(
+            model_name,
+            dataset,
+            data_root=data_root,
+            seed=seed,
+        )
+        available_steps_per_seed[seed] = available_steps
+        if requested_steps is not None:
+            missing_steps = sorted(requested_steps.difference(available_steps))
+            if missing_steps:
+                raise ValueError(
+                    f"Requested ModelZoo steps {missing_steps} are not available for seed {seed}."
+                )
+
+    if requested_steps is None:
+        shared_steps = sorted(set.intersection(*[set(steps) for steps in available_steps_per_seed.values()]))
+        if not shared_steps:
+            raise ValueError("No shared ModelZoo checkpoint steps were found across the selected seeds.")
+    else:
+        shared_steps = sorted(requested_steps)
+
+    for seed in seeds_to_save:
+        for step in shared_steps:
+            _, save_path = save_modelzoo_checkpoint_summary(
+                model_name,
+                dataset,
+                step,
+                seed,
+                data_root=data_root,
+                results_dir=results_dir,
+            )
+            saved_paths.append(save_path)
+            if verbose:
+                print(f"Saved ModelZoo summary: {save_path}")
+
+    return saved_paths
+
+
 def _optimizer_resnet_checkpoint_sort_key(file_path):
     match = re.fullmatch(r"step_(\d+)_repeat_(\d+)\.safetensors", file_path.name)
     if match is None:
@@ -956,6 +1212,27 @@ def weight_gram_sl(network):
      else:
         W = network.fc1.weight.detach()
      return W @ W.T
+
+
+def weight_spectra_wtw(network):
+    spectra = {}
+    for name, module in network.named_modules():
+        if not isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+            continue
+
+        weight = module.weight.detach()
+        weight_matrix = weight.flatten(1) if isinstance(module, torch.nn.Conv2d) else weight
+        gram = weight_matrix.T @ weight_matrix
+        eigvals = torch.linalg.eigvalsh(gram)
+
+        spectra[name] = {
+            "eigenvalues": eigvals.cpu().numpy(),
+            "aspect_ratio": weight_matrix.shape[1] / weight_matrix.shape[0],
+            "weight_shape": tuple(weight.shape),
+            "matrix_shape": tuple(weight_matrix.shape),
+        }
+
+    return spectra
     
 
 def _per_example_channel_standardize_and_rescale(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -1063,12 +1340,12 @@ def get_free_energy(files, key, energy_type='ck'):
                 energies.append(res_dict['weight_free_energy'])
         return np.array(energies)
 
-def get_test_acc(files, key):
+def get_test_acc(files, key, acc_key='test_acc'):
         key_files = get_key_files(files, key)
         accuracies = []
         for file in key_files:
             res_dict = torch.load(file, weights_only=False, map_location='cpu')
-            accuracies.append(res_dict['test_acc'])
+            accuracies.append(res_dict[acc_key])
         return np.array(accuracies)
 
 def get_train_loss(files, key):
@@ -1078,6 +1355,14 @@ def get_train_loss(files, key):
             res_dict = torch.load(file, weights_only=False, map_location='cpu')
             losses.append(res_dict['train_loss'])
         return np.array(losses)
+
+def get_train_acc(files, key):
+        key_files = get_key_files(files, key)
+        accs = []
+        for file in key_files:
+            res_dict = torch.load(file, weights_only=False, map_location='cpu')
+            accs.append(res_dict['train_acc'])
+        return np.array(accs)
 
     
 def marchenko_pastur_pdf(lmbda, beta):
@@ -1654,6 +1939,7 @@ def find_best_htmp(
     eigs,
     gamma,
     search_method='grid',
+    method='pdf',
     kappa_min=1e-3,
     kappa_max=1e1,
     num_kappas=100,
@@ -1662,7 +1948,6 @@ def find_best_htmp(
     num_betas=None,
     n_eval = 50,
     inverse=False,
-    stieltjes=False,
     lp_ord=1,
     vectorized_grid=True,
     kappa_log_scale=True,
@@ -1670,6 +1955,65 @@ def find_best_htmp(
     beta_log_scale=True,
     verbose=False
 ):
+    method = method.lower()
+    if method not in ('pdf', 'stieltjes', 'ks'):
+        raise ValueError("method must be one of: 'pdf', 'stieltjes', 'ks'")
+    stieltjes = method == 'stieltjes'
+
+    if method == 'ks':
+        from htmp_cdf import compute_htmp_ks_distance
+
+        def objective(kappa, beta):
+            return compute_htmp_ks_distance(
+                eigs,
+                kappa,
+                gamma,
+                beta,
+                tau=0.0,
+                inverse=inverse,
+                return_details=False,
+            )
+
+        if search_method == 'grid':
+            if kappa_log_scale:
+                kappa_values = np.logspace(np.log10(kappa_min), np.log10(kappa_max), num_kappas)
+            else:
+                kappa_values = np.linspace(kappa_min, kappa_max, num_kappas)
+            if beta_log_scale:
+                beta_values = np.logspace(np.log10(beta_min), np.log10(beta_max), num_betas if num_betas is not None else 1)
+            else:
+                beta_values = np.linspace(beta_min, beta_max, num_betas if num_betas is not None else 1)
+
+            best_kappa = None
+            best_beta = None
+            best_distance = float('inf')
+            for kappa in kappa_values:
+                for beta in beta_values:
+                    distance = objective(kappa, beta)
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_kappa = kappa
+                        best_beta = beta
+
+            if verbose:
+                print(f"Best grid point: kappa={best_kappa:.4g}, beta={best_beta:.4g}, distance={best_distance:.6g}")
+            _warn_if_at_boundary(best_kappa, best_beta, kappa_min, kappa_max, beta_min, beta_max, ignore_beta=(num_betas is None or num_betas == 1 ))
+            return best_kappa, best_beta, best_distance
+
+        if search_method == 'ternary':
+            best_kappa, best_beta, best_distance = ternary_search_2d(
+                objective,
+                x_left=kappa_min, x_right=kappa_max, x_its=num_kappas,
+                y_left=beta_min, y_right=beta_max, y_its=num_betas if num_betas is not None else 1,
+                verbose=verbose,
+                log_scale_x=kappa_log_scale,
+                log_scale_y=beta_log_scale,
+            )
+            _warn_if_at_boundary(best_kappa, best_beta, kappa_min, kappa_max, beta_min, beta_max, ignore_beta=(num_betas is None or num_betas == 1 ))
+            return best_kappa, best_beta, best_distance
+
+        raise ValueError(f"Invalid search method: {search_method}. Choose 'grid' or 'ternary'.")
+
     if search_method == 'grid':
         if vectorized_grid:
             if kappa_log_scale:
@@ -1754,3 +2098,15 @@ def find_best_htmp(
     
     else:
         raise ValueError(f"Invalid search method: {search_method}. Choose 'grid' or 'ternary'.")
+
+
+def compute_correlation(x, y, method='pearson'):
+    method = method.lower()
+    if method == 'pearson':
+        return np.corrcoef(x, y)[0, 1]
+    if method == 'spearman':
+        return stats.spearmanr(x, y).statistic
+    if method == 'kendall':
+        res = stats.kendalltau(x, y)
+        return res.statistic, res.pvalue
+    raise ValueError("method must be one of: 'pearson', 'spearman', 'kendall'")
