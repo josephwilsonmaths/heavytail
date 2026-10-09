@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use this code in your research, please cite the paper listed in preferred-citation."
+type: software
+title: "heavytail: Code for Why Heavy-Tailed Weight Spectra Predict Model Quality"
+license: MIT
+repository-code: "https://github.com/josephwilsonmaths/heavytail"
+authors:
+  - family-names: Wilson
+    given-names: Joseph
+preferred-citation:
+  type: conference-paper
+  title: "Why Heavy-Tailed Weight Spectra Predict Model Quality"
+  authors:
+    - family-names: Wilson
+      given-names: Joseph
+      affiliation: School of Mathematics and Physics, University of Queensland
+    - family-names: van der Heide
+      given-names: Chris
+      affiliation: Department of Electrical and Electronic Engineering, University of Melbourne
+    - family-names: Hodgkinson
+      given-names: Liam
+      affiliation: School of Mathematics and Statistics, University of Melbourne
+    - family-names: Wang
+      given-names: Zhichao
+      affiliation: ICSI and Department of Statistics, University of California, Berkeley
+    - family-names: Roosta
+      given-names: Fred
+      affiliation: CIRES and School of Mathematics and Physics, University of Queensland
+    - family-names: Mahoney
+      given-names: Michael W.
+      affiliation: ICSI, LBNL and Department of Statistics, University of California, Berkeley
+  year: 2026
+  conference:
+    name: "40th Conference on Neural Information Processing Systems (NeurIPS 2026)"

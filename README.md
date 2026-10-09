@@ -1,6 +1,6 @@
-# Why Do Heavy-Tailed Weights Predict Model Quality?
+# Why Heavy-Tailed Weight Spectra Predict Model Quality
 
-Code for the paper *Why Do Heavy-Tailed Weights Predict Model Quality?*
+Code for the paper *Why Heavy-Tailed Weight Spectra Predict Model Quality*
 
 ## Setup
 
@@ -80,3 +80,27 @@ Populate `results/htmp/epoch` in either of these ways:
 - `esdfit.py`: loads saved summaries, fits heavy-tailed Marchenko-Pastur models, and creates analysis figures.
 - `htmp_cdf.py`: evaluates HTMP CDFs and KS distances; run `python htmp_cdf.py --help` for its command-line interface.
 
+
+## Licence
+
+The code is released under the [MIT licence](LICENSE).
+
+## Citation
+
+If you use this code in your research, please cite:
+
+Joseph Wilson, Chris van der Heide, Liam Hodgkinson, Zhichao Wang, Fred Roosta,
+and Michael W. Mahoney. *Why Heavy-Tailed Weight Spectra Predict Model Quality*.
+40th Conference on Neural Information Processing Systems (NeurIPS 2026), 2026.
+
+```bibtex
+@inproceedings{wilson2026heavytailed,
+  title = {Why Heavy-Tailed Weight Spectra Predict Model Quality},
+  author = {Wilson, Joseph and van der Heide, Chris and Hodgkinson, Liam and
+            Wang, Zhichao and Roosta, Fred and Mahoney, Michael W.},
+  booktitle = {40th Conference on Neural Information Processing Systems (NeurIPS 2026)},
+  year = {2026}
+}
+```
+
+Machine-readable citation metadata is available in [CITATION.cff](CITATION.cff).
