@@ -1,5 +1,7 @@
 import os
+import json
 import numbers
+import warnings
 import torch
 import glob
 import matplotlib.pyplot as plt
@@ -11,11 +13,42 @@ import powerlaw
 import tqdm
 from helpers import *
 from htmp_cdf import compute_htmp_ks_distance, compute_mp_ks_distance, evaluate_htmp_cdf
-from matplotlib.ticker import FormatStrFormatter
+from matplotlib.ticker import FormatStrFormatter, LogFormatterSciNotation, NullLocator
 import texplot
 
+def set_iclr_style(markersize = 4, linewidth = 0.9, legend_font=4):
+    texplot.set_theme(
+        context="paper",
+        # use_latex=True,
+        rc={
+            "font.family": "serif",
+
+            "font.size": 8,
+            "axes.labelsize": 7,
+            "axes.titlesize": 8,
+
+            "xtick.labelsize": 6,
+            "ytick.labelsize": 6,
+            "legend.fontsize": legend_font,
+            "legend.markerscale": 1,
+
+            "lines.linewidth": linewidth,
+            "axes.linewidth": linewidth,
+            "lines.markersize": markersize,
+
+            "xtick.major.width": 0.8,
+            "ytick.major.width": 0.8,
+
+
+            # "text.latex.preamble":
+            #     r"\usepackage{times}"
+            #     r"\usepackage{amsmath}"
+            #     r"\usepackage{amssymb}",
+        },
+    )
+
 class ESDFit(object):
-    def __init__(self, model='minialexnet', dataset='cifar10', kernel='weight', batch_size=None, subsample=False, file_dir = 'results/htmp/epoch', weight_type=None, layer=None, trim_bottom_eigs=0, trim_top_eigs=0, permuted_labels=False, nonzero_eigs_only=False):
+    def __init__(self, model='minialexnet', dataset='cifar10', kernel='weight', batch_size=None, subsample=False, file_dir = 'results/htmp/epoch', weight_type=None, layer=None, trim_bottom_eigs=0, trim_top_eigs=0, permuted_labels=False, nonzero_eigs_only=False, learning_rate=None, optimizer=None, initial_mp_scale=1.0):
         self.model = model
         self.dataset = dataset
         self.kernel = kernel
@@ -28,6 +61,9 @@ class ESDFit(object):
         self.trim_top_eigs = int(trim_top_eigs)
         self.permuted_labels = permuted_labels
         self.nonzero_eigs_only = nonzero_eigs_only
+        self.learning_rate = None if learning_rate is None else float(learning_rate)
+        self.optimizer = None if optimizer is None else str(optimizer).strip().lower()
+        self.initial_mp_scale = self._normalize_initial_mp_scale(initial_mp_scale)
 
         self.fileloader = fileloading(
             model,
@@ -42,6 +78,8 @@ class ESDFit(object):
             trim_top_eigs=trim_top_eigs,
             permuted_labels=permuted_labels,
             nonzero_eigs_only=nonzero_eigs_only,
+            learning_rate=learning_rate,
+            optimizer=optimizer,
         )
 
         self.epoch_list = self.fileloader.get_epoch_list()
@@ -52,6 +90,7 @@ class ESDFit(object):
         self._dist_opt_by_kernel = {}
 
         self.lam = None
+        self.lams = {}
         self.free_energies = {}
         self.free_energy_vars = {}
         self.free_energy_stds = {}
@@ -78,6 +117,41 @@ class ESDFit(object):
 
     def get_available_layers(self):
         return self.fileloader.get_available_layers()
+
+    def _normalize_initial_mp_scale(self, scale):
+        """Validate the scale used for the epoch-zero MP distribution.
+
+        A positive number supplies an explicit scale. ``'mean'`` (or
+        ``'auto'``) estimates the scale from the epoch-zero mean eigenvalue.
+        """
+        if isinstance(scale, str):
+            normalized = scale.strip().lower()
+            if normalized in ('mean', 'auto'):
+                return 'mean'
+            raise ValueError("initial_mp_scale must be a positive number, 'mean', or 'auto'.")
+
+        try:
+            normalized = float(scale)
+        except (TypeError, ValueError):
+            raise ValueError("initial_mp_scale must be a positive number, 'mean', or 'auto'.") from None
+        if not np.isfinite(normalized) or normalized <= 0:
+            raise ValueError("initial_mp_scale must be a positive finite number, 'mean', or 'auto'.")
+        return normalized
+
+    def _resolve_initial_mp_scale(self, eigs):
+        if self.initial_mp_scale != 'mean':
+            return self.initial_mp_scale
+
+        eigs = np.asarray(eigs, dtype=float)
+        finite_eigs = eigs[np.isfinite(eigs)]
+        if finite_eigs.size == 0:
+            raise ValueError("Cannot infer initial_mp_scale from an empty or non-finite spectrum.")
+        scale = float(np.mean(finite_eigs))
+        if scale <= 0 or not np.isfinite(scale):
+            raise ValueError(
+                f"Cannot infer a positive initial_mp_scale from mean eigenvalue {scale}."
+            )
+        return scale
 
     def print_available_layers(self):
         layers = self.get_available_layers()
@@ -298,12 +372,24 @@ class ESDFit(object):
         return {epoch: self.fileloader.get_eigs_epoch(epoch) for epoch in epochs_to_fit}
 
     def _get_gamma(self, epoch=None):
-        # nonzero_eigs_only trims eigenvalues using the per-layer saved aspect ratio,
-        # so the gamma for fitting must also come from that saved ratio.
-        if self.fileloader._uses_saved_aspect_ratio() or (self.nonzero_eigs_only and epoch is not None):
-            if epoch is None:
-                raise ValueError("epoch must be provided when resolving gamma for a checkpoint-summary model.")
-            return self.fileloader.get_aspect_ratio_epoch(epoch)
+        if epoch is None and self.epoch_list:
+            epoch = self.epoch_list[0]
+        if epoch is not None:
+            try:
+                gamma = self.fileloader.get_aspect_ratio_epoch(epoch)
+                if np.isfinite(gamma):
+                    return gamma
+            except KeyError:
+                pass
+            except ValueError as exc:
+                if "must be set to load a saved aspect ratio" not in str(exc):
+                    raise
+            warnings.warn(
+                f"No saved gamma found for epoch {epoch}; using gamma_dict instead.",
+                stacklevel=2,
+            )
+        else:
+            warnings.warn("No saved gamma found; using gamma_dict instead.", stacklevel=2)
         return gamma_dict[self.model][self.kernel]
 
     def _get_gamma_by_epoch(self, epochs):
@@ -371,10 +457,11 @@ class ESDFit(object):
         eigs_value = self.fileloader.get_eigs_epoch(epoch) if eigs is None else eigs
 
         if epoch == 0 and not self.inverse_htmp:
+            mp_scale = self._resolve_initial_mp_scale(eigs_value)
             return compute_mp_ks_distance(
                 eigs_value,
                 self._get_gamma(epoch),
-                scale=1.0,
+                scale=mp_scale,
                 tau=0.0,
                 return_details=return_details,
             )
@@ -676,6 +763,10 @@ class ESDFit(object):
 
     def _get_fit_scope_key(self):
         parts = [str(self.kernel)]
+        if self.learning_rate is not None:
+            parts.append(f"learning_rate={self.learning_rate}")
+        if self.optimizer is not None:
+            parts.append(f"optimizer={self.optimizer}")
         if self.permuted_labels:
             parts.append('permuted_labels=True')
         if self.nonzero_eigs_only:
@@ -691,6 +782,10 @@ class ESDFit(object):
         return '|'.join(parts)
 
     def _append_fit_scope_to_filename(self, filename):
+        if self.learning_rate is not None:
+            filename += f'_lr{self.learning_rate}'
+        if self.optimizer is not None:
+            filename += f'_{str(self.optimizer).lower()}'
         if self.permuted_labels:
             filename += '_permuted_labels'
         if self.nonzero_eigs_only:
@@ -792,6 +887,8 @@ class ESDFit(object):
                 'permuted_labels': self.permuted_labels,
                 'nonzero_eigs_only': self.nonzero_eigs_only,
                 'batch_size': self.batch_size,
+                'learning_rate': self.learning_rate,
+                'optimizer': self.optimizer,
                 'subsample': self.subsample,
                 'source_file_dir': self.file_dir,
                 'fitted_epochs': list(self.fitted_epochs),
@@ -814,7 +911,7 @@ class ESDFit(object):
 
     def load_htmp_fit(self, file_path=None, file_dir='results/htmp/fits', verbose=False):
         load_path = file_path or self._get_fit_params_path(file_dir)
-        legacy_path = None if file_path is not None else self._get_legacy_fit_params_path(file_dir)
+        legacy_path = None if file_path is not None or self.learning_rate is not None or self.optimizer is not None else self._get_legacy_fit_params_path(file_dir)
         if not os.path.exists(load_path):
             if legacy_path is not None and os.path.exists(legacy_path):
                 load_path = legacy_path
@@ -1134,6 +1231,29 @@ class ESDFit(object):
         return {'mean': mean, 'var': var, 'std': std, 'ci95': ci95, 'count': int(values.size)}
 
     def compute_free_energy(self, lam=0.5, tau=0, weight_inverse=False):
+        """Compute empirical and theoretical free energies for every epoch.
+
+        ``lam`` may be a positive scalar or ``'fro_norm_inv'``.  The latter
+        selects a separate value at each epoch according to
+
+            lam_t = m / Tr(W_t.T @ W_t),
+
+        where ``m`` is the number of eigenvalues in that epoch's spectrum.
+        The resolved values are stored in ``self.lams``.
+        """
+        use_fro_norm_inv = isinstance(lam, str)
+        if use_fro_norm_inv:
+            if lam != 'fro_norm_inv':
+                raise ValueError("lam must be a positive scalar or 'fro_norm_inv'.")
+            fixed_lam = None
+        else:
+            try:
+                fixed_lam = float(lam)
+            except (TypeError, ValueError):
+                raise ValueError("lam must be a positive scalar or 'fro_norm_inv'.") from None
+            if not np.isfinite(fixed_lam) or fixed_lam <= 0:
+                raise ValueError("lam must be a positive finite scalar.")
+
         self.free_energies = {}
         self.free_energy_vars = {}
         self.free_energy_stds = {}
@@ -1150,18 +1270,34 @@ class ESDFit(object):
         self.empirical_log_det_ci95 = {}
         self.theoretical_traces = {}
         self.theoretical_log_dets = {}
+        self.lams = {}
         self.traces = self.empirical_traces
         self.log_dets = self.empirical_log_dets
         self.weight_inverse = weight_inverse
 
         for epoch in self.epoch_list:
             repeat_eigs = self.fileloader.get_eigs_epoch_values(epoch)
+            if use_fro_norm_inv:
+                epoch_eigs = np.concatenate([
+                    np.asarray(eigs, dtype=float).reshape(-1) for eigs in repeat_eigs
+                ]) if repeat_eigs else np.array([], dtype=float)
+                eig_sum = float(np.sum(epoch_eigs))
+                if epoch_eigs.size == 0 or not np.isfinite(eig_sum) or eig_sum <= 0:
+                    raise ValueError(
+                        f"Cannot compute lam='fro_norm_inv' at epoch {epoch}: "
+                        "the eigenspectrum must be non-empty with a positive, finite sum."
+                    )
+                epoch_lam = float(epoch_eigs.size / eig_sum)
+            else:
+                epoch_lam = fixed_lam
+            self.lams[epoch] = epoch_lam
+
             free_energy_values = []
             trace_values = []
             log_det_values = []
 
             for eigs in repeat_eigs:
-                f, t, l = self.empirical_free_energy_eigs(eigs, len(eigs), lam=lam, tau=0, weight_inverse=weight_inverse)
+                f, t, l = self.empirical_free_energy_eigs(eigs, len(eigs), lam=epoch_lam, tau=0, weight_inverse=weight_inverse)
                 free_energy_values.append(f)
                 trace_values.append(t)
                 log_det_values.append(l)
@@ -1202,7 +1338,7 @@ class ESDFit(object):
                 kappa_val,
                 gamma,
                 beta_val,
-                lam,
+                epoch_lam,
                 tau_val,
                 weight_inverse=self.weight_inverse
             )
@@ -1575,6 +1711,8 @@ class ESDFit(object):
                                        plot_h_over_h_star=False):
         epochs = self.epoch_list[start_index:]
 
+        set_iclr_style()
+
         if plot_h_over_h_star:
             if lam is None:
                 raise ValueError("lam must be provided when plot_h_over_h_star=True.")
@@ -1686,7 +1824,7 @@ class ESDFit(object):
             ax_ratio, ax_c, ax_kappa = axes_arr[:3]
             ax_h = axes_arr[3] if plot_h_over_h_star else None
 
-            ax_ratio.plot(x_epochs, y_ratios, marker='o', linestyle='-', color=color, label=f'{self.model.upper()}')
+            ax_ratio.plot(x_epochs, y_ratios, marker='o', linestyle='-', color=color, label=f'{self.model.upper()} {self.dataset.upper()}')
             ax_ratio.set_ylabel('κ / β', fontsize=fontsize)
             ax_ratio.tick_params(axis='both')
             ax_ratio.legend(loc='best')
@@ -1761,7 +1899,7 @@ class ESDFit(object):
                 print(f"Plotting κ/β ratio vs. epoch on provided axes.")
 
             ax_c_twin = None
-            ax.plot(x_epochs, y_ratios, marker='o', linestyle='-', color=color, label=f'{self.model.upper()}')
+            ax.plot(x_epochs, y_ratios, marker='o', linestyle='-', color=color, label=f'{self.model.upper()} {self.dataset.upper()}')
             if plot_c:
                 finite_c_mask = np.isfinite(y_cs)
                 if np.any(finite_c_mask):
@@ -1854,7 +1992,21 @@ class ESDFit(object):
                  title = False,
                  title_new = None,
                  fontsize=12,
-                 file_dir = 'figures/htmp_fits'):
+                 legend_font=12,
+                 file_dir = 'figures/htmp_fits',
+                 y_axis_precision=2):
+        """Plot ESDs with y-axis labels rounded to y_axis_precision decimal places.
+
+        The default is two decimal places. Set y_axis_precision=0 for integers.
+        Applies to every panel, including when log_y=True.
+        """
+        if (isinstance(y_axis_precision, bool)
+                or not isinstance(y_axis_precision, numbers.Integral)
+                or y_axis_precision < 0):
+            raise ValueError('y_axis_precision must be a non-negative integer.')
+
+        set_iclr_style(legend_font=legend_font)
+
 
         if epochs_list is not None:
             epochs_plotting = epochs_list
@@ -1873,8 +2025,8 @@ class ESDFit(object):
         f, axes = plt.subplots(int(np.ceil(len(epochs_plotting) / num_plots_per_row_)), 
                                num_plots_per_row_, 
                                figsize=(fig_width, fig_height_per_row * int(np.ceil(len(epochs_plotting) / num_plots_per_row_))),
-                               layout="constrained")
-        f.subplots_adjust(hspace=0.4, top=0.8, left=0.14)
+                                     constrained_layout=True)
+        # f.subplots_adjust(hspace=0.4, top=0.8, left=0.14)
         axes_list = (axes.flatten() if len(epochs_plotting) > 1 else [axes])
 
         def format_fit_label(epoch_value):
@@ -1934,15 +2086,18 @@ class ESDFit(object):
             if log_y:
                 ax.set_yscale('log')
 
-            ax.hist(eigs, bins=bins, density=True, color='grey')
-            ax.set_title(f'Epoch = {epoch}', fontsize=fontsize)
+            # Theme-forced white edges can hide narrow histogram bars entirely.
+            ax.hist(eigs, bins=bins, density=True, color='grey', edgecolor='none', linewidth=0)
+            # ax.set_title(f'Epoch = {epoch}', fontsize=fontsize)
+            ax.set_title(f'Epoch = {epoch}')
             
             # Plot powerlaw fit
             if plot_power:
                 try:
                     fit = powerlaw.Fit(eigs, verbose=0)
                     fit.power_law.plot_pdf(ax=ax, color='red', label=f'α: {fit.power_law.alpha:.3f}')
-                    ax.legend(fontsize=fontsize-2)
+                    # ax.legend(fontsize=fontsize-2)
+                    ax.legend()
                 except Exception as e:
                     print(f"Error fitting powerlaw: {e}")
 
@@ -1962,7 +2117,8 @@ class ESDFit(object):
 
                 if epoch == 0 and not self.inverse_htmp:
                     gamma = self._get_gamma(epoch)
-                    mp_vals = marchenko_pastur_pdf(lmbda_vals, gamma)
+                    mp_scale = self._resolve_initial_mp_scale(eigs)
+                    mp_vals = marchenko_pastur_pdf(lmbda_vals / mp_scale, gamma) / mp_scale
                     # When only nonzero eigenvalues are shown the histogram integrates to 1,
                     # but the MP density integrates to gamma (<1); rescale to match.
                     # if self.nonzero_eigs_only and gamma < 1:
@@ -1989,7 +2145,6 @@ class ESDFit(object):
                 ax.legend(
                     handles=[Line2D([], [], linestyle='none')],
                     labels=[format_fit_label(epoch)],
-                    fontsize=fontsize-2,
                     frameon=False,
                     handlelength=0,
                     handletextpad=0,
@@ -1997,21 +2152,27 @@ class ESDFit(object):
                     loc='upper right'
                 )
 
-            ax.tick_params(axis='both', labelsize=fontsize)
-            ax.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
+            ax.tick_params(axis='both')
+            ax.yaxis.set_major_formatter(FormatStrFormatter(f'%.{y_axis_precision}f'))
             if x_right is not None:
                 ax.set_xlim(left = x_left, right=x_right)
 
         if title:
             if title_new is not None:
-                f.text(-0.02, 0.5, title_new, fontsize=fontsize, fontweight='bold', rotation=90, va='center', ha='left')
+                f.supylabel(
+                    title_new,
+                    va='center',
+                )
             else:
-                f.text(-0.02, 0.5, self.model.upper(), fontsize=fontsize, fontweight='bold', rotation=90, va='center', ha='left')
+                f.supylabel(
+                    self.model.upper(),
+                    va='center',
+                )
             
         plt_file = self._get_figure_file_stem(file_dir)
         os.makedirs(os.path.dirname(plt_file), exist_ok=True)
         if save_fig:
-            plt.savefig(f'{plt_file}_esd.pdf', bbox_inches='tight', format='pdf')
+            plt.savefig(f'{plt_file}_esd.pdf', format='pdf')
         if show_fig:
             plt.show()
 
@@ -2178,16 +2339,49 @@ class ESDFit(object):
                           log_x=False,
                           texplot_enabled=False,
                           optimal_ratio=None,
+                          optimal_ratio_ms=8,
                           marker_size=8,
+                          linewidth=1.0,
                           title=True,
                           legend_on=True,
                           tight_layout=True,
                           acc_key='test_acc',
                           vline_epochs=None,
-                          vline_width=1.0):
+                          vline_width=1.0,
+                          num_xticks=5,
+                          confidence_int = True,
+                          legend_markerscale=1.0,
+                          legend_loc='best',
+                          bbox_to_anchor=None,
+                          free_energy_precision=2):
+        """Plot evaluation metrics against free energy with num_xticks major x ticks.
+
+        Epoch ticks use a subset of the plotted checkpoints, capped at the
+        number of distinct available epochs.
+        Set num_xticks=None to retain automatic tick placement.
+        Y ticks are placed automatically. free_energy_precision controls the
+        significant figures on the free-energy y axis (default: 2); the evaluation
+        metric y axis retains two significant figures.
+        legend_markerscale scales legend markers relative to the plotted markers.
+        legend_loc sets the Matplotlib legend location (e.g. 'upper right' or
+        'lower left') for both layouts.
+        """
+        if num_xticks is not None and (
+            isinstance(num_xticks, bool)
+            or not isinstance(num_xticks, numbers.Integral)
+            or num_xticks < 1
+        ):
+            raise ValueError('num_xticks must be a positive integer or None.')
+
+        if (isinstance(free_energy_precision, bool)
+                or not isinstance(free_energy_precision, numbers.Integral)
+                or free_energy_precision < 1):
+            raise ValueError('free_energy_precision must be a positive integer.')
+
         if self.fileloader._is_moonlight_model():
             raise NotImplementedError("Moonlight models do not yet support plotting test accuracy against free energy.")
 
+        set_iclr_style(markersize=marker_size, linewidth=linewidth)
         epochs = self.epoch_list[start_index:]
         if any(epoch not in self.free_energies for epoch in epochs):
             print("Please run .compute_free_energy() before plotting.")
@@ -2196,10 +2390,15 @@ class ESDFit(object):
         _acc_key_labels = {
             'test_acc': 'Test Accuracy',
             'permuted_test_acc': 'Permuted Test Accuracy',
-            'test_loss': 'Test Cross-Entropy',
+            'test_loss': 'Test CE',
             'permuted_test_loss': 'Permuted Test Cross-Entropy',
+
         }
         acc_label = _acc_key_labels.get(acc_key, acc_key)
+        model_label = self.model.upper()
+        if model_label.removeprefix('ELEUTHERAI/').startswith('PYTHIA-'):
+            model_label = model_label.removesuffix('-DEDUPED').removesuffix('_DEDUPED')
+        data_label = self.dataset.upper()
 
         test_acc_stats = [
             self.fileloader.get_test_acc_epoch_stats(
@@ -2219,6 +2418,9 @@ class ESDFit(object):
         mult = (-1 if neg_free else 1)
         free_energies = np.array([mult * self.free_energies[epoch] for epoch in epochs])
         free_energy_ci95 = np.array([self.free_energy_ci95.get(epoch, np.nan) for epoch in epochs])
+        if not confidence_int:
+            test_acc_ci95 = np.zeros_like(test_accs)
+            free_energy_ci95 = np.zeros_like(free_energies)
 
         theoretical_free_energies = None
         if plot_theoretical_free:
@@ -2237,7 +2439,9 @@ class ESDFit(object):
             xs = [self.kappa_opt[epoch] / self.beta_opt[epoch] for epoch in epochs]
             xlabel = 'κ / β'
         elif variable == 'bartlett_ratio':
-            xs = self.lam * np.array([self.kappa_opt[epoch] / self.beta_opt[epoch] for epoch in epochs]) / (2 * self._get_gamma())
+            epoch_lams = np.array([self.lams[epoch] for epoch in epochs])
+            gammas = np.array([self._get_gamma(epoch) for epoch in epochs])
+            xs = epoch_lams * np.array([self.kappa_opt[epoch] / self.beta_opt[epoch] for epoch in epochs]) / (2 * gammas)
             xlabel = 'Bartlett Ratio'
 
         valid_vline_epochs = []
@@ -2263,36 +2467,38 @@ class ESDFit(object):
         print(f'SpearmanCorr: {corr:.3f}')
         print(f'Kendall Tau: {kendall_tau:.3f}, p-value: {kendall_p}')
         print(f'Pearson r: {pearson_r:.3f}')
+        print(f'Lambda: {self.lams}')
 
-        if texplot_enabled:
-            texplot.set_theme()
-        else:
-            texplot.reset_theme()
+        # if texplot_enabled:
+        #     texplot.set_theme()
+        # else:
+        #     texplot.reset_theme()
 
         if single_plot:
             
 
-            fig, ax1 = plt.subplots(figsize=(fig_width, fig_height))
+            fig, ax1 = plt.subplots(figsize=(fig_width, fig_height),
+                                     constrained_layout=True)
             ax2 = ax1.twinx()
 
-            test_line = ax1.plot(xs, test_accs, marker='o', markerfacecolor='none', color='red', label='Accuracy (Mean)')
+            test_line = ax1.plot(xs, test_accs, marker='o', markerfacecolor='none', color='red', label='Error (Mean)')
             test_band = ax1.fill_between(
                 xs,
                 test_accs - test_acc_ci95,
                 test_accs + test_acc_ci95,
                 color='red',
                 alpha=0.15,
-                label='Accuracy (95% CI)'
+                label='Error (95% CI)'
             )
 
-            free_line = ax2.plot(xs, free_energies, marker='x', color='green', label='Free Energy (Mean)')
+            free_line = ax2.plot(xs, free_energies, marker='x', color='green', label='BFE-W (Mean)')
             free_band = ax2.fill_between(
                 xs,
                 free_energies - free_energy_ci95,
                 free_energies + free_energy_ci95,
                 color='green',
                 alpha=0.15,
-                label='Free Energy (95% CI)'
+                label='BFE-W (95% CI)'
             )
             if plot_theoretical_free:
                 theoretical_line = ax2.plot(
@@ -2301,24 +2507,25 @@ class ESDFit(object):
                     marker='s',
                     linestyle='--',
                     color='blue',
-                    label='Theoretical Free Energy'
+                    label=r'$\mathcal{F}_{\infty}^{\lambda}$'
                 )
             else:
                 theoretical_line = []
 
-            ax1.set_xlabel(xlabel, fontsize=fontsize)
-            ax1.set_ylabel(acc_label, fontsize=fontsize)
-            ax2.set_ylabel('Free Energy', fontsize=fontsize)
-            ax1.tick_params(axis='y', labelsize=ticksize)
-            ax1.tick_params(axis='x', labelsize=ticksize)
-            ax2.tick_params(axis='y', labelsize=ticksize)
-            ax2.tick_params(axis='x', labelsize=ticksize)
-            # Only have 5 ticks for x and y axis
-            ax1.locator_params(axis='x', nbins=5)
-            ax1.locator_params(axis='y', nbins=5)
-            ax2.locator_params(axis='y', nbins=5)
+            ax1.set_xlabel(xlabel)
+            ax1.set_ylabel(acc_label)
+            ax2.set_ylabel('Free Energy')
+            ax1.tick_params(axis='y')
+            ax1.tick_params(axis='x')
+            ax2.tick_params(axis='y')
+            ax2.tick_params(axis='x')
             if title:
-                ax1.set_title(fr'{self.model.upper()} ($\rho$: {corr:.3f}, $\lambda$: {self.lam:.2f})', fontweight='bold', fontsize=fontsize)
+                lam_label = (
+                    r'$\lambda_t = ||W||_\mathrm{F}^{-2}$'
+                    if self.lam == 'fro_norm_inv'
+                    else fr'$\lambda$: {self.lam:.2f}'
+                )
+                ax1.set_title(fr'{model_label} {data_label}')
 
             if log_x:
                 ax1.set_xscale('log')
@@ -2326,13 +2533,16 @@ class ESDFit(object):
 
             if optimal_ratio is not None:
                 # Place a marker on the free energy at the optimal kappa_beta_ratio, if provided
-                ax2.scatter(
+                marker_free_energies = (
+                    theoretical_free_energies if plot_theoretical_free else free_energies
+                )
+                ratio_marker = ax2.scatter(
                     optimal_ratio,
-                    theoretical_free_energies[np.nanargmin(np.abs(np.array(xs, dtype=float) - optimal_ratio))],
+                    marker_free_energies[np.nanargmin(np.abs(np.array(xs, dtype=float) - optimal_ratio))],
                     color='purple',
-                    label=f'Optimal Ratio = {optimal_ratio:.3f}',
+                    label=fr'Optimal Ratio $h^*$',
                     marker='X',
-                    s=marker_size,
+                    s=optimal_ratio_ms,
                     zorder=5,
                 )
 
@@ -2342,8 +2552,12 @@ class ESDFit(object):
 
             lines = test_line + [test_band] + free_line + [free_band] + theoretical_line
             labels = [line.get_label() for line in test_line] + [test_band.get_label()] + [line.get_label() for line in free_line] + [free_band.get_label()] + [line.get_label() for line in theoretical_line]
+            if optimal_ratio is not None:
+                lines.append(ratio_marker)
+                labels.append(ratio_marker.get_label())
             if legend_on:
-                ax1.legend(lines, labels, loc='best', fontsize=legendsize, frameon=legendbox)
+                ax1.legend(lines, labels, loc=legend_loc, frameon=legendbox, bbox_to_anchor=bbox_to_anchor,
+                           markerscale=legend_markerscale)
         else:
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(fig_width, fig_height), sharex=True)
             test_line = ax1.plot(xs, test_accs, marker='o', markerfacecolor='none', color='red', label='Mean')
@@ -2358,7 +2572,8 @@ class ESDFit(object):
             ax1.set_ylabel(acc_label)
             ax1.set_xlabel(xlabel)
             ax1.tick_params(axis='y', labelsize=ticksize)
-            ax1.legend(test_line + [test_band], [line.get_label() for line in test_line] + [test_band.get_label()], loc='best')
+            ax1.legend(test_line + [test_band], [line.get_label() for line in test_line] + [test_band.get_label()],
+                       loc=legend_loc, markerscale=legend_markerscale)
             if log_x:
                 ax1.set_xscale('log')
 
@@ -2378,7 +2593,8 @@ class ESDFit(object):
             ax2.set_xlabel(xlabel)
             ax2.set_ylabel('Negative Free Energy' if neg_free else 'Free Energy')
             ax2.tick_params(axis='y')
-            ax2.legend(free_line + [free_band] + theoretical_line, [line.get_label() for line in free_line] + [free_band.get_label()] + [line.get_label() for line in theoretical_line], loc='best')
+            ax2.legend(free_line + [free_band] + theoretical_line, [line.get_label() for line in free_line] + [free_band.get_label()] + [line.get_label() for line in theoretical_line],
+                       loc=legend_loc, markerscale=legend_markerscale)
             if log_x:
                 ax2.set_xscale('log')
 
@@ -2386,7 +2602,37 @@ class ESDFit(object):
                 ax1.axvline(vline_epoch, linestyle=':', color='black', linewidth=vline_width)
                 ax2.axvline(vline_epoch, linestyle=':', color='black', linewidth=vline_width)
 
-            fig.suptitle(f'{self.model.upper()} ($r$: {corr:.3f})', fontweight='bold', fontsize=fontsize, y=0.94)
+            if title:
+                fig.suptitle(f'{model_label} ($r$: {corr:.3f})', fontweight='bold', y=0.94)
+
+        ax1.yaxis.set_major_formatter(FormatStrFormatter('%#.2g'))
+        ax2.yaxis.set_major_formatter(
+            FormatStrFormatter(f'%#.{free_energy_precision}g')
+        )
+
+        if num_xticks is not None:
+            tick_values = np.asarray(xs, dtype=float)
+            tick_values = tick_values[np.isfinite(tick_values)]
+            if log_x:
+                tick_values = tick_values[tick_values > 0]
+            if variable == 'epochs':
+                tick_values = np.unique(tick_values)
+                tick_count = min(num_xticks, tick_values.size)
+                indices = np.rint(np.linspace(0, tick_values.size - 1, tick_count)).astype(int)
+                ticks = tick_values[indices]
+            else:
+                if tick_values.size > 1 and np.min(tick_values) < np.max(tick_values):
+                    x_min, x_max = np.min(tick_values), np.max(tick_values)
+                else:
+                    x_min, x_max = ax1.get_xlim()
+                ticks = (np.geomspace if log_x else np.linspace)(x_min, x_max, num_xticks)
+            # Both layouts share the x axis, so setting one updates both panels.
+            ax1.set_xticks(ticks)
+            ax1.xaxis.set_minor_locator(NullLocator())
+            if log_x:
+                ax1.xaxis.set_major_formatter(LogFormatterSciNotation(
+                    labelOnlyBase=False, minor_thresholds=(np.inf, np.inf)
+                ))
 
         if skipped_vline_epochs:
             skipped_vlines_str = ', '.join(str(epoch) for epoch in skipped_vline_epochs)
@@ -2412,7 +2658,9 @@ class ESDFit(object):
         if tight_layout:
             fig.tight_layout()
         if save_fig:
-            plt.savefig(f'{plt_file}_test_vs_free_energy_vs_{variable}.pdf', bbox_inches='tight', format='pdf')
+            # Enforce TrueType embedding even when themes restore Type 3 defaults.
+            with plt.rc_context({'pdf.fonttype': 42}):
+                fig.savefig(f'{plt_file}_{acc_key}_vs_free_energy_vs_{variable}.pdf', format='pdf')
         if show_fig:
             plt.show()
 
@@ -2739,7 +2987,7 @@ class ESDFit(object):
 
 
 class fileloading(object):
-    def __init__(self, model='minialexnet', dataset='cifar10', kernel='weight', batch_size=None, subsample=False, file_dir = 'results/htmp/epoch', weight_type=None, layer=None, trim_bottom_eigs=0, trim_top_eigs=0, permuted_labels=False, nonzero_eigs_only=False):
+    def __init__(self, model='minialexnet', dataset='cifar10', kernel='weight', batch_size=None, subsample=False, file_dir = 'results/htmp/epoch', weight_type=None, layer=None, trim_bottom_eigs=0, trim_top_eigs=0, permuted_labels=False, nonzero_eigs_only=False, learning_rate=None, optimizer=None):
         self.model = model
         self.dataset = dataset
         self.kernel = kernel
@@ -2752,6 +3000,9 @@ class fileloading(object):
         self.trim_top_eigs = self._normalize_trim_count(trim_top_eigs, 'trim_top_eigs')
         self.permuted_labels = permuted_labels
         self.nonzero_eigs_only = nonzero_eigs_only
+        self.learning_rate = None if learning_rate is None else float(learning_rate)
+        self.optimizer = None if optimizer is None else str(optimizer).strip().lower()
+        self._resnet_run_format = False
 
         self.filename = f'{model}_{dataset}'
         if subsample:
@@ -2768,9 +3019,94 @@ class fileloading(object):
             self.files = [f for f in self.files if '_permuted_labels' in Path(f).stem]
         else:
             self.files = [f for f in self.files if '_permuted_labels' not in Path(f).stem]
+        if len(self.files) == 0:
+            self.files = self._find_resnet_run_files()
+            self._resnet_run_format = len(self.files) > 0
         self.files = self._filter_files_for_scope(self.files)
-        self.epoch_list = sorted(get_keys(self.files), reverse=False)
+        if self._resnet_run_format:
+            self.epoch_list = sorted({int(epoch) for file in self.files for epoch in self._load_resnet_run_array(file, 'epoch')})
+        else:
+            self.epoch_list = sorted(get_keys(self.files), reverse=False)
         self._pythia_eval_cache = {}
+
+    def _find_resnet_run_files(self):
+        if not re.fullmatch(r'resnet(?:18|34|50|100|152)', str(self.model).strip().lower()):
+            return []
+        if self.subsample or self.permuted_labels or self.weight_type is not None or self.layer is not None:
+            return []
+
+        root = Path(self.file_dir)
+        model_dir_name = f'{str(self.model).strip().lower()}_{str(self.dataset).strip().lower()}'
+        if (root / 'config.json').is_file():
+            run_dirs = [root]
+        else:
+            model_dir = root if root.name.lower() == model_dir_name else root / model_dir_name
+            if not model_dir.is_dir():
+                return []
+            run_dirs = sorted(path for path in model_dir.iterdir() if (path / 'config.json').is_file())
+
+        matches = []
+        for run_dir in run_dirs:
+            with (run_dir / 'config.json').open('r', encoding='utf-8') as handle:
+                config = json.load(handle)
+            if str(config.get('model', '')).lower() != str(self.model).strip().lower():
+                continue
+            if str(config.get('dataset', '')).lower() != str(self.dataset).strip().lower():
+                continue
+            if self.batch_size is not None and int(config.get('batch_size', -1)) != int(self.batch_size):
+                continue
+            if self.learning_rate is not None and not np.isclose(float(config.get('learning_rate', np.nan)), float(self.learning_rate)):
+                continue
+            if self.optimizer is not None and str(config.get('optimizer', '')).lower() != str(self.optimizer).strip().lower():
+                continue
+            matches.append((run_dir, config))
+
+        if len(matches) > 1:
+            choices = ', '.join(
+                f"{run_dir.name}: batch_size={config.get('batch_size')}, learning_rate={config.get('learning_rate')}, optimizer={config.get('optimizer')}"
+                for run_dir, config in matches
+            )
+            raise ValueError(f'Multiple ResNet runs matched ({choices}). Set batch_size and learning_rate to select one.')
+        if len(matches) == 0 and ((root / 'config.json').is_file() or 'resnet_runs' in {part.lower() for part in root.parts}):
+            raise FileNotFoundError(
+                f'No ResNet run matched model={self.model}, dataset={self.dataset}, '
+                f'batch_size={self.batch_size}, learning_rate={self.learning_rate}, optimizer={self.optimizer} in {root}.'
+            )
+        if len(matches) == 0:
+            return []
+        if self.kernel not in ('weight', 'ck'):
+            raise ValueError("ResNet run spectra support kernel='weight' or kernel='ck', not NTK spectra.")
+
+        return [str(path) for path in sorted(matches[0][0].glob('repeat_*/spectra.npz'))]
+
+    def _load_resnet_run_array(self, file, key):
+        with np.load(file, allow_pickle=False) as data:
+            return np.asarray(data[key])
+
+    def _get_resnet_run_epoch_files(self, epoch):
+        return [file for file in self.files if int(epoch) in self._load_resnet_run_array(file, 'epoch')]
+
+    def _get_resnet_run_epoch_array(self, file, epoch, key):
+        epochs = self._load_resnet_run_array(file, 'epoch')
+        indices = np.flatnonzero(epochs == int(epoch))
+        if len(indices) == 0:
+            raise KeyError(f'Epoch {epoch} was not found in {file}.')
+        values = self._load_resnet_run_array(file, key)
+        return np.asarray(values[indices[-1]], dtype=float)
+
+    def _get_resnet_run_diagnostic(self, file, epoch, key):
+        diagnostics = pd.read_csv(Path(file).with_name('diagnostics.csv'))
+        rows = diagnostics.loc[diagnostics['epoch'] == int(epoch)]
+        if rows.empty:
+            return np.nan
+        return float(rows.iloc[-1][key])
+
+    def _get_resnet_run_training_metric(self, file, epoch, key):
+        training = pd.read_csv(Path(file).with_name('training.csv'))
+        rows = training.loc[training['epoch'] == int(epoch)]
+        if rows.empty:
+            return np.nan
+        return float(rows.iloc[-1][key])
 
     def get_epoch_list(self):
         return self.epoch_list
@@ -2842,9 +3178,13 @@ class fileloading(object):
     def _load_reference_result_dict(self):
         if len(self.files) == 0:
             raise FileNotFoundError(f'No checkpoint files found for pattern {self.filename} in {self.file_dir}.')
+        if self._resnet_run_format:
+            return {}
         return torch.load(self.files[0], weights_only=False, map_location='cpu')
 
     def get_available_layers(self):
+        if self._resnet_run_format:
+            return []
         res_dict = self._load_reference_result_dict()
 
         if 'weight_spectra_wtw' in res_dict:
@@ -2984,7 +3324,11 @@ class fileloading(object):
         layer_key = self._resolve_saved_layer_key(layer_dict)
         return float(layer_dict[layer_key]['aspect_ratio'])
 
-    def _get_eigvals_from_file(self, file):
+    def _get_eigvals_from_file(self, file, epoch=None):
+        if self._resnet_run_format:
+            key = 'last_layer_eigenvalues' if self.kernel == 'weight' else 'feature_eigenvalues'
+            return self._get_resnet_run_epoch_array(file, epoch, key)
+
         res_dict = torch.load(file, weights_only=False, map_location='cpu')
 
         new_format_eigs = self._get_new_format_eigvals(res_dict)
@@ -2998,7 +3342,15 @@ class fileloading(object):
         }[self.kernel]
         return self._keep_nonzero_eigvals(np.asarray(res_dict[eig_key], dtype=float), res_dict)
 
-    def _get_aspect_ratio_from_file(self, file):
+    def _get_aspect_ratio_from_file(self, file, epoch=None):
+        if self._resnet_run_format:
+            feature_dim = self._get_resnet_run_diagnostic(file, epoch, 'feature_dim')
+            if self.kernel == 'ck':
+                sample_count = self._get_resnet_run_diagnostic(file, epoch, 'sample_count')
+                return feature_dim / sample_count
+            eig_count = self._get_resnet_run_epoch_array(file, epoch, 'last_layer_eigenvalues').size
+            return eig_count / feature_dim
+
         res_dict = torch.load(file, weights_only=False, map_location='cpu')
 
         try:
@@ -3009,27 +3361,27 @@ class fileloading(object):
             ) from exc
 
     def get_eigs_epoch(self, epoch):
-        key_files = get_key_files(self.files, epoch)
-        eigvals_by_repeat = [self._get_eigvals_from_file(file) for file in key_files]
+        key_files = self._get_resnet_run_epoch_files(epoch) if self._resnet_run_format else get_key_files(self.files, epoch)
+        eigvals_by_repeat = [self._get_eigvals_from_file(file, epoch) for file in key_files]
         if len(eigvals_by_repeat) == 0:
             return np.array([])
         eigs = np.concatenate(eigvals_by_repeat)
         return self._trim_aggregated_eigs(eigs)
 
     def get_aspect_ratio_epoch(self, epoch):
-        key_files = get_key_files(self.files, epoch)
+        key_files = self._get_resnet_run_epoch_files(epoch) if self._resnet_run_format else get_key_files(self.files, epoch)
         if len(key_files) == 0:
             return np.nan
 
-        aspect_ratios = [self._get_aspect_ratio_from_file(file) for file in key_files]
+        aspect_ratios = [self._get_aspect_ratio_from_file(file, epoch) for file in key_files]
         first_aspect_ratio = float(aspect_ratios[0])
         if not all(np.isclose(first_aspect_ratio, aspect_ratio) for aspect_ratio in aspect_ratios[1:]):
             raise ValueError(f"Found inconsistent saved aspect ratios for epoch {epoch}.")
         return self._get_effective_aspect_ratio(first_aspect_ratio)
 
     def get_eigs_epoch_values(self, epoch):
-        key_files = get_key_files(self.files, epoch)
-        eigvals_by_repeat = [self._get_eigvals_from_file(file) for file in key_files]
+        key_files = self._get_resnet_run_epoch_files(epoch) if self._resnet_run_format else get_key_files(self.files, epoch)
+        eigvals_by_repeat = [self._get_eigvals_from_file(file, epoch) for file in key_files]
         if not self._has_trimmed_spectrum():
             return eigvals_by_repeat
         if len(eigvals_by_repeat) == 0:
@@ -3037,6 +3389,12 @@ class fileloading(object):
         return [self._trim_aggregated_eigs(np.concatenate(eigvals_by_repeat))]
 
     def get_test_acc_epoch_values(self, epoch, acc_key='test_acc'):
+        if self._resnet_run_format:
+            diagnostic_key = {'test_acc': 'test_accuracy', 'test_loss': 'test_loss'}.get(acc_key, acc_key)
+            return np.asarray([
+                self._get_resnet_run_diagnostic(file, epoch, diagnostic_key)
+                for file in self._get_resnet_run_epoch_files(epoch)
+            ], dtype=float)
         return np.asarray(get_test_acc(self.files, epoch, acc_key=acc_key), dtype=float)
 
     def _is_pythia_model(self):
@@ -3051,10 +3409,10 @@ class fileloading(object):
 
     def _is_optimizer_resnet_model(self):
         model_name = str(self.model).strip().lower()
-        return bool(re.fullmatch(r'resnet(?:9|18|34|50)_.+', model_name))
+        return bool(re.fullmatch(r'resnet(?:9|18|34|50|100|152)_.+', model_name))
 
     def _uses_saved_aspect_ratio(self):
-        return self.weight_type is not None or self._is_pythia_model() or self._is_moonlight_model() or self._is_optimizer_resnet_model()
+        return self._resnet_run_format or self.weight_type is not None or self._is_pythia_model() or self._is_moonlight_model() or self._is_optimizer_resnet_model()
 
     def _resolve_pythia_model_size_and_deduped(self, deduped):
         model_name = str(self.model).strip().lower()
@@ -3116,7 +3474,7 @@ class fileloading(object):
             return {
                 'mean': float(row['value']),
                 'std': stderr,
-                'ci95': stderr,
+                'ci95': 1.96 * stderr,
                 'count': 1,
             }
 
@@ -3133,7 +3491,7 @@ class fileloading(object):
         return self.get_test_acc_epoch_stats(epoch)['mean']
 
     def get_test_loss_epoch_values(self, epoch, loss_key='test_loss'):
-        return np.asarray(get_test_acc(self.files, epoch, acc_key=loss_key), dtype=float)
+        return self.get_test_acc_epoch_values(epoch, acc_key=loss_key)
 
     def get_test_loss_epoch_stats(self,
                                   epoch,
@@ -3162,24 +3520,33 @@ class fileloading(object):
         return self.get_test_loss_epoch_values(epoch)
     
     def get_train_loss_epoch(self, epoch):
+        if self._resnet_run_format:
+            return np.nanmean([
+                self._get_resnet_run_training_metric(file, epoch, 'train_loss')
+                for file in self._get_resnet_run_epoch_files(epoch)
+            ]).item()
         return get_train_loss(self.files, epoch).mean().item()
 
     def get_train_loss_epoch_all(self, epoch):
+        if self._resnet_run_format:
+            return np.asarray([
+                self._get_resnet_run_training_metric(file, epoch, 'train_loss')
+                for file in self._get_resnet_run_epoch_files(epoch)
+            ], dtype=float)
         return get_train_loss(self.files, epoch)
 
     def get_train_acc_epoch(self, epoch):
+        if self._resnet_run_format:
+            return np.nanmean([
+                self._get_resnet_run_training_metric(file, epoch, 'train_accuracy')
+                for file in self._get_resnet_run_epoch_files(epoch)
+            ]).item()
         return get_train_acc(self.files, epoch).mean().item()
 
     def get_train_acc_epoch_all(self, epoch):
+        if self._resnet_run_format:
+            return np.asarray([
+                self._get_resnet_run_training_metric(file, epoch, 'train_accuracy')
+                for file in self._get_resnet_run_epoch_files(epoch)
+            ], dtype=float)
         return get_train_acc(self.files, epoch)
-
-    
-
-
-    
-    
-
-
-
-
-        

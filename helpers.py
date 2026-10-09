@@ -2,6 +2,7 @@ from matplotlib import transforms
 import json
 from pathlib import Path
 import re
+import warnings
 from urllib.request import Request, urlopen
 import shutil
 import mpmath
@@ -202,81 +203,38 @@ def save_pythia_checkpoint_summary(
     print_possible_steps=False,
     delete_model_cache=False,
     access_token=None,
+    device="cpu",
+    spectral_dtype=torch.float32,
+    resume=True,
+    verbose=True,
 ):
-    """Download a Pythia checkpoint, compute spectral stats, and save an epoch-style result file.
+    """Download checkpoint shards and save QueryKey, Dense and EmbedOut spectra.
 
-    The saved dictionary contains:
-        - QueryKey: per-layer eigenvalues/aspect ratio for W=query_key_value
-        - Dense: per-layer eigenvalues/aspect ratio for W=dense_h_to_4h
-        - EmbedOut: eigenvalues/aspect ratio for W=embed_out
+    Computes eigenvalues of W.T @ W one matrix at a time, without loading a
+    language model. The existing NumPy-based result format and filename are
+    preserved: <model>_pile_b2m_<step>_0.pt. Cache files are retained on failure.
 
-    The output filename follows epoch.py conventions:
-        <model>_pile_b2m_<step>_0.pt
+    device selects the eigensolver device (CPU by default). spectral_dtype is
+    float32 by default; float64 can improve accuracy near zero at higher cost.
+    With resume=True, completed summaries are reused and interrupted runs resume
+    from a .partial.pt file saved after every matrix. Set resume=False to
+    recompute, including when changing precision. results_dir must be trusted.
+    delete_model_cache removes the step cache only after successfully saving.
+    evals_root is retained for compatibility; spectra do not need eval files.
     """
-
-    from transformers import GPTNeoXForCausalLM
+    from util.pythia_spectra import save_checkpoint_summary
 
     if print_possible_steps:
         steps = np.concatenate([np.array([0]), np.logspace(0, 9, 10, base=2), np.linspace(1000, 143000, 143)])
         print("Possible steps for Pythia models:")
         print(steps)
 
-    short_model_name = _normalize_pythia_model_name(model_name)
-    repo_id = model_name if str(model_name).startswith("EleutherAI/") else f"EleutherAI/{short_model_name}"
-    step = int(step)
-
-    model_cache_dir = Path(model_cache_root) / short_model_name / f"step{step}"
-    model = GPTNeoXForCausalLM.from_pretrained(
-        repo_id,
-        revision=f"step{step}",
-        cache_dir=str(model_cache_dir),
-        token=access_token
+    return save_checkpoint_summary(
+        model_name, step, model_cache_root=model_cache_root,
+        results_dir=results_dir, delete_model_cache=delete_model_cache,
+        access_token=access_token, device=device, spectral_dtype=spectral_dtype,
+        resume=resume, verbose=verbose,
     )
-    model.eval()
-
-    querykey = {}
-    dense = {}
-    for idx, layer in enumerate(model.gpt_neox.layers):
-        qk_w = layer.attention.query_key_value.weight.detach().to(dtype=torch.float32)
-        qk_eigvals = torch.linalg.eigvalsh(qk_w.T @ qk_w)
-        querykey[idx] = {
-            "eigvals": qk_eigvals.cpu().numpy(),
-            "aspect_ratio": qk_w.shape[1] / qk_w.shape[0],
-        }
-
-        dense_w = layer.mlp.dense_h_to_4h.weight.detach().to(dtype=torch.float32)
-        dense_eigvals = torch.linalg.eigvalsh(dense_w.T @ dense_w)
-        dense[idx] = {
-            "eigvals": dense_eigvals.cpu().numpy(),
-            "aspect_ratio": dense_w.shape[1] / dense_w.shape[0],
-        }
-
-    embed_out_w = model.embed_out.weight.detach().to(dtype=torch.float32)
-    embed_out_eigvals = torch.linalg.eigvalsh(embed_out_w.T @ embed_out_w)
-    embed_out = {
-        "eigvals": embed_out_eigvals.cpu().numpy(),
-        "aspect_ratio": embed_out_w.shape[1] / embed_out_w.shape[0],
-    }
-
-    res_dict = {
-        "QueryKey": querykey,
-        "Dense": dense,
-        "EmbedOut": embed_out,
-        "model": short_model_name,
-        "dataset": "pile",
-        "epoch": step,
-    }
-
-    results_dir = Path(results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    save_path = results_dir / f"{short_model_name}_pile_b2m_{step}_0.pt"
-    torch.save(res_dict, save_path)
-
-    del model
-    if delete_model_cache and model_cache_dir.exists():
-        shutil.rmtree(model_cache_dir, ignore_errors=True)
-
-    return res_dict, save_path
 
 
 def list_pythia_eval_tasks(
@@ -346,7 +304,9 @@ def load_pythia_eval_metric(
         shot: Subdirectory under the model directory, usually "zero-shot" or "five-shot".
 
     Returns:
-        pandas.DataFrame with columns step, value, metric, task, shot, and file.
+        pandas.DataFrame with columns step, value, metric, task, shot, file,
+        and stderr. For ppl, value is log perplexity and stderr is its
+        approximate standard error (delta method).
     """
 
     model_dir = _get_pythia_eval_model_dir(
@@ -372,15 +332,22 @@ def load_pythia_eval_metric(
         step = _extract_pythia_eval_step(payload, file_path)
         stderr_key = f"{metric_key}_stderr"
 
+        value = float(task_results[metric_key])
+        stderr = float(task_results[stderr_key]) if stderr_key in task_results else np.nan
+        if metric == 'ppl':
+            # Propagate uncertainty through log: SE(log P) ~= SE(P) / P.
+            stderr = stderr / value
+            value = np.log(value)
+
         rows.append(
             {
                 "step": step,
-                "value": float(task_results[metric_key]),
+                "value": value,
                 "metric": metric_key,
                 "task": task,
                 "shot": shot,
                 "file": str(file_path),
-                "stderr": float(task_results[stderr_key]) if stderr_key in task_results else np.nan,
+                "stderr": stderr,
             }
         )
 
@@ -453,6 +420,118 @@ def plot_pythia_eval_metric(
         ax.legend()
 
     return df, ax
+
+
+def plot_pythia_train_losses(
+    models=("pythia-410m-deduped", "pythia-1b-deduped", "pythia-12b-deduped"),
+    *,
+    train_log_file="results/pythia/training_logs/pythia_deduped_v2_train_loss_checkpoints.csv",
+    start_index=0,
+    log_scale_loss=False,
+    fig_width=10,
+    fig_height=6,
+    fontsize=12,
+    ticksize=10,
+    legendsize=10,
+    save_fig=True,
+    show_fig=True,
+    file_dir="output/pdf",
+):
+    """Plot deduped-v2 Pythia training loss at saved spectral checkpoints.
+
+    The input CSV is produced by
+    ``scripts_to_save_ww/download_pythia_wandb_logs.py``.  Its epochs are the
+    Pythia optimizer-step values stored in the spectral-summary filenames.
+    Missing W&B history remains missing rather than being interpolated.
+
+    Returns:
+        ``(dataframe, figure, axes)`` for reuse in notebooks.
+    """
+
+    train_log_file = Path(train_log_file)
+    if not train_log_file.is_file():
+        raise FileNotFoundError(
+            f"Pythia training-loss file not found: {train_log_file}. "
+            "Run scripts_to_save_ww/download_pythia_wandb_logs.py first."
+        )
+
+    train_logs = pd.read_csv(train_log_file)
+    required_columns = {"model", "epoch", "train_loss"}
+    missing_columns = required_columns.difference(train_logs.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Training-loss CSV is missing required columns: {sorted(missing_columns)}"
+        )
+
+    def canonical_model_name(model):
+        model = str(model).strip().lower().removeprefix("eleutherai/")
+        model = model.removeprefix("pythia-").removesuffix("-deduped")
+        return f"pythia-{_normalize_pythia_model_size(model)}-deduped"
+
+    canonical_models = [canonical_model_name(model) for model in models]
+    if not canonical_models:
+        raise ValueError("At least one Pythia model must be provided.")
+
+    selected = train_logs.loc[train_logs["model"].isin(canonical_models)].copy()
+    unknown_models = [model for model in canonical_models if model not in set(selected["model"])]
+    if unknown_models:
+        raise ValueError(f"No downloaded training logs found for: {unknown_models}")
+
+    fig, ax_loss = plt.subplots(figsize=(fig_width, fig_height))
+    plotted_frames = []
+    display_sizes = {"410m": "410M", "1b": "1B", "12b": "12B"}
+
+    for model in canonical_models:
+        model_rows = selected.loc[selected["model"] == model].sort_values("epoch")
+        model_rows = model_rows.iloc[int(start_index):].copy()
+        plotted_frames.append(model_rows)
+
+        available = model_rows.dropna(subset=["train_loss"])
+        if available.empty:
+            warnings.warn(f"No finite training-loss values are available for {model}.")
+            continue
+
+        missing_epochs = model_rows.loc[model_rows["train_loss"].isna(), "epoch"].astype(int).tolist()
+        if missing_epochs:
+            warnings.warn(
+                f"{model}: W&B has no training loss for {len(missing_epochs)} saved "
+                f"checkpoint(s), beginning at epoch {missing_epochs[0]}."
+            )
+
+        size = model.removeprefix("pythia-").removesuffix("-deduped")
+        label = f"Pythia {display_sizes.get(size, size.upper())} deduped v2"
+        ax_loss.plot(
+            available["epoch"],
+            available["train_loss"],
+            marker="x",
+            linewidth=1.8,
+            markersize=6,
+            label=label,
+        )
+
+    ax_loss.set_xlabel("Epoch (training step)", fontsize=fontsize)
+    ax_loss.set_ylabel("Train Loss", fontsize=fontsize)
+    ax_loss.tick_params(axis="both", labelsize=ticksize)
+    ax_loss.set_title("Pythia Deduped v2 Train Loss vs. Epoch", fontsize=fontsize)
+    ax_loss.grid(True, alpha=0.25)
+    ax_loss.set_xlim(left=0)
+    if log_scale_loss:
+        ax_loss.set_yscale("log")
+    ax_loss.legend(loc="best", fontsize=legendsize)
+    fig.tight_layout()
+
+    output_path = None
+    if save_fig:
+        output_dir = Path(file_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "pythia_deduped_v2_train_loss_vs_epoch.pdf"
+        fig.savefig(output_path, bbox_inches="tight", format="pdf")
+    if show_fig:
+        plt.show()
+
+    plotted_data = pd.concat(plotted_frames, ignore_index=True)
+    plotted_data.attrs["output_path"] = None if output_path is None else str(output_path)
+    return plotted_data, fig, ax_loss
 
 
 def list_moonlight_layers(
