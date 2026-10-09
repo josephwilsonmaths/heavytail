@@ -89,10 +89,6 @@ The code is released under the [MIT licence](LICENSE).
 
 If you use this code in your research, please cite:
 
-Joseph Wilson, Chris van der Heide, Liam Hodgkinson, Zhichao Wang, Fred Roosta,
-and Michael W. Mahoney. *Why Heavy-Tailed Weight Spectra Predict Model Quality*.
-40th Conference on Neural Information Processing Systems (NeurIPS 2026), 2026.
-
 ```bibtex
 @inproceedings{wilson2026heavytailed,
   title = {Why Heavy-Tailed Weight Spectra Predict Model Quality},
